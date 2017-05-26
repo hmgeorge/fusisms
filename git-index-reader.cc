@@ -11,6 +11,16 @@
 #include <arpa/inet.h>
 #include <string>
 
+std::string hexdump(uint8_t arr[], uint32_t len) {
+  std::string s;
+  for (uint32_t i=0; i<len; i++) {
+    char buf[3]={'.','.','.'};
+    sprintf(buf, "%02x", arr[i]);
+    s.append(buf);
+  }
+  return s;
+}
+
 // based off https://github.com/git/git/blob/master/Documentation/technical/index-format.txt
 // supports version 2 for now.
 void git_index_read(unsigned char *addr, int len) {
@@ -85,7 +95,7 @@ void git_index_read(unsigned char *addr, int len) {
     cursor += 4;
     file_size = ntohl(file_size);
 
-    char sha1[21]={0};
+    uint8_t sha1[21]={0};
     memcpy(&sha1, addr + cursor, 20);
     cursor += 20;
 
@@ -99,7 +109,8 @@ void git_index_read(unsigned char *addr, int len) {
     memcpy(file_path, addr + cursor, file_len);
     cursor += file_len;
     std::cerr << type << " "
-	      << inode << " "
+	      << hexdump(sha1, sizeof(sha1)-1) << " "
+      //	      << inode <<  " "
 	      << file_path << " "
 	      << file_len << "\n";
     free(file_path);
