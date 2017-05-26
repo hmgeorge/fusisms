@@ -1,3 +1,4 @@
+#include <iostream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/fcntl.h>
@@ -10,44 +11,34 @@
 #include <arpa/inet.h>
 #include <string>
 
-void fill(uint32_t &w, uint8_t *addr, int &cursor) {
-  memcpy(&w, addr + cursor, 4);
-  w = ntohl(w);
-  cursor += 4;
-}
-
-void fill(char *arr, size_t len, uint8_t *addr, int &cursor){
-  memcpy(arr, addr+cursor, len);
-  cursor += len;
-}
-
-void fill(uint16_t &s, uint8_t *addr, int &cursor) {
-  memcpy(&s, addr + cursor, sizeof(uint16_t));
-  s = ntohs(s);
-  cursor += 2;
-}
-
 // based off https://github.com/git/git/blob/master/Documentation/technical/index-format.txt
+// supports version 2 for now.
 void git_index_read(unsigned char *addr, int len) {
   int cursor = 0;
-  char word[4];
+  char word[5]={0};
   memcpy(&word[0], addr + cursor, 4);
   cursor += 4;
 
-  printf("%s\n", word); // DIRC
+  std::cerr << word << "\n"; // DIRC
 
   uint32_t version=0;
   memcpy(&version, addr + cursor, 4);
   cursor += 4;
+  version = ntohl(version);
 
-  printf("%u\n", ntohl(version)); // version
+  std::cerr << version << "\n"; // version
+
+  if (version != 2) {
+    std::cerr << "version > 2 parsing support missing\n";
+    return;
+  }
 
   int32_t num_entries=0;
   memcpy(&num_entries, addr + cursor, 4);
   cursor += 4;
   num_entries = ntohl(num_entries);
 
-  printf("%u\n", num_entries); // version
+  std::cerr << num_entries << "\n"; // version
 
   int i;
   for (i=0; i<num_entries; i++) {
@@ -107,7 +98,10 @@ void git_index_read(unsigned char *addr, int len) {
     char *file_path = (char *)calloc(1, file_len+1);
     memcpy(file_path, addr + cursor, file_len);
     cursor += file_len;
-    fprintf(stderr, "%s %u %s file_len %d\n", type.c_str(), inode, file_path, file_len);
+    std::cerr << type << " "
+	      << inode << " "
+	      << file_path << " "
+	      << file_len << "\n";
     free(file_path);
 
     while (addr[cursor]=='\0') {
