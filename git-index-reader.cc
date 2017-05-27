@@ -9,7 +9,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+
 #include <string>
+#include <memory>
 
 std::string hexdump(uint8_t arr[], uint32_t len) {
   std::string s;
@@ -104,21 +106,76 @@ void git_index_read(unsigned char *addr, int len) {
     cursor += 2;
     flags = ntohs(flags);
 
-    int32_t file_len = flags&0xfff;
+    uint32_t file_len = flags&0xfff;
     char *file_path = (char *)calloc(1, file_len+1);
     memcpy(file_path, addr + cursor, file_len);
+    file_path[file_len]='\0';
     cursor += file_len;
     std::cerr << type << " "
 	      << hexdump(sha1, sizeof(sha1)-1) << " "
       //	      << inode <<  " "
 	      << file_path << " "
-	      << file_len << "\n";
+	      << file_size << "\n";
     free(file_path);
 
     while (addr[cursor]=='\0') {
       cursor++;
     }
-  }	
+  }
+
+  char ext[5]={0};
+  memcpy(&ext[0], addr + cursor, 4);
+  cursor += 4;
+  std::cerr << ext << "\n";
+
+  if (strcmp(ext, "TREE"))
+    return;
+
+  uint32_t ext_size = 0;
+  memcpy(&ext_size, addr + cursor, 4);
+  cursor += 4;
+  ext_size = ntohl(ext_size);
+
+  std::cerr << ext_size << "\n";
+
+  if (cursor + ext_size >= len)
+    return; //bad index
+
+  uint32_t ext_i = 0;
+  while (ext_i < ext_size) {
+    int j=0;
+    while (addr[cursor + j] != '\0') j++; // i must be < ext_size
+    char *path = (char *)calloc(1, j+1);
+    memcpy(path, addr + cursor, j);
+    cursor += j+1; // skip over the \0 as well
+    ext_i += j+1;
+
+    j=0;
+    while (addr[cursor + j] != ' ') j++; // skip over number of entries
+    char *entries = (char *)calloc(1, j+1);
+    memcpy(entries, addr + cursor, j);
+    int num_entries = atoi(entries);
+    cursor += j+1; // skip over the space as well before parsing next
+    ext_i += j+1;
+
+    j=0;
+    while (addr[cursor + j] != '\n') j++; // skip over n of subtrees
+    char *subtrees = (char *)calloc(1, j+1);
+    memcpy(subtrees, addr + cursor, j);
+    int num_sub_tress = atoi(subtrees);
+    cursor += j+1;
+    ext_i += j+1;
+
+    uint8_t sha1[21] = {0};
+    memcpy(&sha1[0], addr + cursor, 20);
+    cursor += 20;
+    ext_i += 20;
+    std::cerr << num_entries << " " << num_sub_tress <<
+      " (" << path << ") " << hexdump(sha1, 20) << "\n";
+    free(path);
+    free(entries);
+    free(subtrees);
+  }
 }
 
 int main(int argc, char **argv)
