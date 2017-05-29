@@ -7,7 +7,7 @@
 // at https://github.com/benhoyt/pygit/blob/master/pygit.py#L441
 
 
-// g++ -std=c++11 git-pack-reader.cc `pkg-config zlib --cflags --libs`
+// g++ -std=c++11 git-pack-reader.cc `pkg-config zlib --cflags --libs` -o pack-reader
 #include <cassert>
 #include <iostream>
 #include <sys/mman.h>
@@ -27,6 +27,7 @@
 #include <iomanip>
 
 #include "zlib.h"
+#include "memory-mapped-file.h"
 #include "utils.h"
 
 typedef enum {
@@ -62,6 +63,8 @@ std::string typeToStr(obj_type_t t) {
   }
   return "";
 }
+
+using MemoryMappedFile = fusism::MemoryMappedFile;
 
 struct PackIdxReader {
   PackIdxReader(char *file) : file_name_(file),
@@ -130,8 +133,8 @@ struct PackIdxReader {
 				return po.sha1() == sha1;
 			      });
     if (po_it == pack_objects_.end()) {
-      std::cerr << hexdump(reinterpret_cast<const uint8_t *>(sha1),
-			   strlen(sha1))  << " not found\n";
+      std::cerr << fusism::hexdump(reinterpret_cast<const uint8_t *>(sha1),
+				   strlen(sha1))  << " not found\n";
       return;
     }
     switch ((*po_it).type()) {
@@ -225,9 +228,9 @@ private:
       uint8_t sha1[21] = {0};
       readBytes(&sha1[0], 20);
 #if DEBUG
-      std::cerr << hexdump(sha1, 20) << "\n";
+      std::cerr << fusism::hexdump(sha1, 20) << "\n";
 #endif
-      pack_objects_.emplace_back(hexdump(sha1, 20),
+      pack_objects_.emplace_back(fusism::hexdump(sha1, 20),
 				 OBJ_NONE,
 				 0,
 				 -1);
@@ -274,8 +277,8 @@ private:
   // perhaps type of an object can be printed by checking the sha1
   // with the pack objects
   void catTree(off64_t offset, off64_t size) {
-    uint8_t *out = zInflate(offset, size);
-    if (!out) return;
+    MemoryMappedFile out(zInflate(offset, size));
+    if (!out.valid()) return;
     off64_t cursor = 0;
     while (cursor < size) {
       // skip permission
@@ -288,19 +291,17 @@ private:
       }
       cursor += 1; // skip NUL as well
       std::cerr << " ";
-      std::cerr << hexdump(&out[cursor], 20) << "\n";
+      std::cerr << out.dump(cursor, 20) << "\n";
       cursor += 20;
     }
-    delete out;
   }
 
   void catCommitTree(off64_t offset, off64_t size) {
-    uint8_t *out = zInflate(offset, size);
-    if (!out) return;
+    MemoryMappedFile out(zInflate(offset, size));
+    if (!out.valid()) return;
 #if DEBUG
-    std::cerr << hexdump(out, size) << "\n";
+    std::cerr << out.dump(0, size) << "\n";
 #endif
-
     off64_t cursor = 0;
     cursor += 4; // skip over TREE
 
@@ -317,15 +318,14 @@ private:
     return cat(&sha1[0]);
   }
 
-  // returns mem for now. to be converted to fd
-  // to a tmp file
-  uint8_t *zInflate(off64_t offset, off64_t size) {
-#define CHUNK 1024
-    uint8_t input[CHUNK];
-    // char tmplate[10]={0};
-    // memcpy(tmplate, "catXXXXXX", strlen("catXXXXXX"));
-    // int temp_fd = mkstemp(tmplate);
-    auto out = new uint8_t[size];
+#define ARRAY_SIZE(a) ((sizeof(a))/sizeof((a[0])))
+  // returns fd to a tmp file
+  int zInflate(off64_t offset, off64_t size) {
+    uint8_t input[1024];
+    uint8_t out[17];
+    char tmplate[16]={0};
+    snprintf(tmplate, sizeof(tmplate), "%s",
+	     "/tmp/catXXXXXX");
     z_stream strm;
     int ret;
 
@@ -336,53 +336,54 @@ private:
     strm.next_in = Z_NULL;
     if (inflateInit(&strm) != Z_OK) {
       std::cerr << "failed to initiaze z_stream\n";
-      return NULL;
+      return -1;
     }
 
-    strm.next_out = out;
-    strm.avail_out = size;
-    uint32_t have = 0;
-#if DEBUG
-    std::cerr << "catTree at offset " << offset << "\n";
-#endif
-    lseek64(packed_fd_, offset, SEEK_SET);
-    do {
-      if (strm.avail_in == 0) {
-#if DEBUG
-	std::cerr << "read next chunk \n";
-#endif
-	strm.avail_in = read(packed_fd_, &input, CHUNK);
-	if (strm.avail_in < 0) {
-	  perror("read");
-	  return NULL;
-	}
-	strm.next_in = &input[0];
-      }
-      ret = inflate(&strm, Z_NO_FLUSH);
-      assert(ret != Z_STREAM_ERROR); /* state not clobbered */
-      switch (ret) {
-      case Z_OK:
-      case Z_STREAM_END:
-	break;
-      case Z_NEED_DICT:
-	ret = Z_DATA_ERROR;     /* and fall through */
-      case Z_DATA_ERROR:
-      case Z_MEM_ERROR:
-	(void)inflateEnd(&strm);
-	std::cerr << ret << " failed to inflate pack\n";
-	return NULL;
-      }
-#if DEBUG
-      std::cerr << size << " " << have << " "
-		<< strm.avail_out << "\n";
-#endif
-    } while (strm.avail_out != 0);
-    (void)inflateEnd(&strm);
+    int temp_fd = mkstemp(tmplate);
+    if (temp_fd < 0) {
+      perror("mkstemp");
+      return -1;
+    }
 
-#if DEBUG
-    std::cerr << hexdump(out, size) << "\n";
-#endif
-    return out;
+    lseek64(packed_fd_, offset, SEEK_SET);
+    bool eos = false;
+    uint32_t written = 0;
+    while (!eos) {
+      strm.next_out = out;
+      strm.avail_out = ARRAY_SIZE(out);
+      do {
+	if (strm.avail_in == 0) {
+	  strm.avail_in = read(packed_fd_, &input, ARRAY_SIZE(input));
+	  if (strm.avail_in < 0) {
+	    perror("read");
+	    return -1;
+	  }
+	  strm.next_in = &input[0];
+	}
+	ret = inflate(&strm, Z_NO_FLUSH);
+	assert(ret != Z_STREAM_ERROR); /* state not clobbered */
+	switch (ret) {
+	case Z_STREAM_END:
+	  eos = true;
+	case Z_OK:
+	  break;
+	default:
+	  (void)inflateEnd(&strm);
+	  std::cerr << ret << " failed to inflate pack\n";
+	  return -1;
+	}
+      } while (!eos && strm.avail_out > 0);
+      if (!eos) {
+	assert(strm.avail_out == 0);
+      }
+      written += write(temp_fd, out, ARRAY_SIZE(out)-strm.avail_out);
+    }
+    (void)inflateEnd(&strm);
+    if (written != size) {
+      std::cerr << ret << " failed to inflate pack completely\n";
+      return -1;
+    }
+    return temp_fd;
   }
 
   int setupPackedFd() {
