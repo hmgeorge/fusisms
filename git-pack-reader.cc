@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 
+#include <functional>
+#include <algorithm>
 #include <vector>
 #include <iomanip>
 
@@ -116,6 +118,34 @@ struct PackIdxReader {
     populate();
   }
 
+  void cat(const char *sha1) {
+    if (!init_check_) {
+      std::cerr << "init_check failed" << "\n";
+      return;
+    }
+
+    auto po_it = std::find_if(pack_objects_.begin(),
+			      pack_objects_.end(),
+			      [&](PackObject &po) -> bool {
+				return po.sha1() == sha1;
+			      });
+    if (po_it == pack_objects_.end()) {
+      std::cerr << hexdump(reinterpret_cast<const uint8_t *>(sha1),
+			   strlen(sha1))  << " not found\n";
+      return;
+    }
+    switch ((*po_it).type()) {
+    case OBJ_COMMIT:
+      catCommitTree((*po_it).offset(), (*po_it).size());
+      break;
+    case OBJ_TREE:
+      catTree((*po_it).offset(), (*po_it).size());
+      break;
+    default:
+      break;
+    }
+  }
+
   int list() {
     if (!init_check_) {
       std::cerr << "init_check failed" << "\n";
@@ -123,25 +153,11 @@ struct PackIdxReader {
     }
 
     for (auto &po : pack_objects_) {
-      lseek64(packed_fd_, po.offset(), SEEK_SET);
-      uint8_t byte;
-      read(packed_fd_, &byte, 1);
-      int type = (byte>>4)&0x7;
-      uint64_t obj_size = (byte&0xf); // 0TTTSSSS 1SSSSSS 0SSSSSSS
-      int32_t sh=4;
-      bool cont = byte&0x80;
-      while (cont) {
-	read(packed_fd_, &byte, 1);
-	obj_size |= ((byte&0x7f)<<sh);
-	sh += 7;
-	cont = (byte & 0x80);
-      }
-
       std::cerr << po.sha1()
 		<< " "
-		<< std::setw(8) << obj_size
+		<< std::setw(8) << po.size()
 		<< " "
-		<< typeToStr((obj_type_t)type)
+		<< typeToStr(po.type())
 		<< "\n";
     }
   }
@@ -160,13 +176,39 @@ struct PackIdxReader {
   
 private:
   struct PackObject {
-    PackObject(std::string s, off64_t offset) : sha1_(s), offset_(offset) { }
+    PackObject(std::string sha1,
+	       obj_type_t t,
+	       off64_t offset,
+	       off64_t size) : sha1_(sha1),
+			       type_(t),
+			       offset_(offset),
+			       size_(size) { }
     std::string sha1() { return sha1_; }
+    void update(std::function<uint8_t(void) > br) {
+      uint8_t byte = br();
+      type_ = (obj_type_t)((byte>>4)&0x7);
+      size_ = (byte&0xf); // 0TTTSSSS 1SSSSSS 0SSSSSSS
+      int32_t sh=4;
+      bool cont = byte&0x80;
+      while (cont) {
+	byte = br();
+	size_ |= ((byte&0x7f)<<sh);
+	sh += 7;
+	cont = (byte & 0x80);
+      }
+    }
     off64_t offset() { return offset_; }
+    obj_type_t type() { return type_; }
+    off64_t size() { return size_; }
     void setOffset(off64_t o) { offset_ = o; }
+    void setSize(off64_t size) { size_ = size; }
+    void setType(obj_type_t t) { type_ = t; }
+
   private:
     std::string sha1_;
     off64_t offset_;
+    off64_t size_;
+    obj_type_t type_;
   };
 
   ssize_t populate() {
@@ -185,7 +227,10 @@ private:
 #if DEBUG
       std::cerr << hexdump(sha1, 20) << "\n";
 #endif
-      pack_objects_.emplace_back(hexdump(sha1, 20), -1);
+      pack_objects_.emplace_back(hexdump(sha1, 20),
+				 OBJ_NONE,
+				 0,
+				 -1);
     }
 
     // skip over the table of 4-byte crc32 values
@@ -200,7 +245,16 @@ private:
 	std::cerr << "ignore large file offsets\n";
 	continue;
       }
-      pack_objects_[i].setOffset(offset);
+      if (offset == 246) {
+	std::cerr << "add entry at offset " << offset << "\n";
+      }
+      lseek64(packed_fd_, offset, SEEK_SET);
+      pack_objects_[i].update([=](void) -> uint8_t {
+	uint8_t byte;
+	read(packed_fd_, &byte, 1);
+	return byte;
+	});
+      pack_objects_[i].setOffset(lseek64(packed_fd_, 0, SEEK_CUR));
 #if DEBUG
       std::cerr << offset <<"\n";
 #endif
@@ -208,6 +262,127 @@ private:
 
     std::cerr << "file looks good\n";
     init_check_ = true;
+  }
+
+  // offset in the pack file and uncompressed size
+  // as per the spec.
+  // after inflate, the format for the tree seems to be
+  // 6 bytes permission (e.g 100644)
+  // 1 byte space (0x20)
+  // NUL terminated path name (e.g 616c6c6f6376312e6300)
+  // 20 byte sha1 (e.g c4d5514e3a9fe3ee04d3d12d89eecf5a8eac3ebb)
+  // perhaps type of an object can be printed by checking the sha1
+  // with the pack objects
+  void catTree(off64_t offset, off64_t size) {
+    uint8_t *out = zInflate(offset, size);
+    if (!out) return;
+    off64_t cursor = 0;
+    while (cursor < size) {
+      // skip permission
+      while (out[cursor] != ' ') ++cursor;
+      // skip space as well
+      cursor += 1;
+      while (out[cursor] != '\0') {
+	std::cerr << out[cursor];
+	cursor += 1;
+      }
+      cursor += 1; // skip NUL as well
+      std::cerr << " ";
+      std::cerr << hexdump(&out[cursor], 20) << "\n";
+      cursor += 20;
+    }
+    delete out;
+  }
+
+  void catCommitTree(off64_t offset, off64_t size) {
+    uint8_t *out = zInflate(offset, size);
+    if (!out) return;
+#if DEBUG
+    std::cerr << hexdump(out, size) << "\n";
+#endif
+
+    off64_t cursor = 0;
+    cursor += 4; // skip over TREE
+
+    cursor += 1; // skip over space
+
+    // next 40 chars contains the string
+    // representation of the 20 byte sha1
+    char sha1[41]={0};
+    for (uint32_t i=0; i<40; ++i) {
+      sha1[i] = out[cursor];
+      cursor+=1;
+    }
+
+    return cat(&sha1[0]);
+  }
+
+  // returns mem for now. to be converted to fd
+  // to a tmp file
+  uint8_t *zInflate(off64_t offset, off64_t size) {
+#define CHUNK 1024
+    uint8_t input[CHUNK];
+    // char tmplate[10]={0};
+    // memcpy(tmplate, "catXXXXXX", strlen("catXXXXXX"));
+    // int temp_fd = mkstemp(tmplate);
+    auto out = new uint8_t[size];
+    z_stream strm;
+    int ret;
+
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    if (inflateInit(&strm) != Z_OK) {
+      std::cerr << "failed to initiaze z_stream\n";
+      return NULL;
+    }
+
+    strm.next_out = out;
+    strm.avail_out = size;
+    uint32_t have = 0;
+#if DEBUG
+    std::cerr << "catTree at offset " << offset << "\n";
+#endif
+    lseek64(packed_fd_, offset, SEEK_SET);
+    do {
+      if (strm.avail_in == 0) {
+#if DEBUG
+	std::cerr << "read next chunk \n";
+#endif
+	strm.avail_in = read(packed_fd_, &input, CHUNK);
+	if (strm.avail_in < 0) {
+	  perror("read");
+	  return NULL;
+	}
+	strm.next_in = &input[0];
+      }
+      ret = inflate(&strm, Z_NO_FLUSH);
+      assert(ret != Z_STREAM_ERROR); /* state not clobbered */
+      switch (ret) {
+      case Z_OK:
+      case Z_STREAM_END:
+	break;
+      case Z_NEED_DICT:
+	ret = Z_DATA_ERROR;     /* and fall through */
+      case Z_DATA_ERROR:
+      case Z_MEM_ERROR:
+	(void)inflateEnd(&strm);
+	std::cerr << ret << " failed to inflate pack\n";
+	return NULL;
+      }
+#if DEBUG
+      std::cerr << size << " " << have << " "
+		<< strm.avail_out << "\n";
+#endif
+    } while (strm.avail_out != 0);
+    (void)inflateEnd(&strm);
+
+#if DEBUG
+    std::cerr << hexdump(out, size) << "\n";
+#endif
+    return out;
   }
 
   int setupPackedFd() {
@@ -261,10 +436,19 @@ private:
   std::vector<PackObject> pack_objects_;
 };
 
+void usage() {
+  std::cerr << "pack-reader /path/to/idx/file sha1\n";
+}
+
 // read the idx file.
 // use it to index into the .pack file.
 int main(int argc, char **argv)
 {
+  if (argc < 3) {
+    usage();
+    exit(-1);
+  }
   PackIdxReader reader(argv[1]);
-  reader.list();
+  // reader.list();
+  reader.cat(argv[2]);
 }
