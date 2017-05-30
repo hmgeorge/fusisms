@@ -11,7 +11,7 @@ struct MemoryMappedFile {
   bool valid() { return fd_ >= 0; }
   uint8_t operator[](off64_t offset);
   std::string dump(off64_t offset, off64_t len);
-
+  off64_t size() { return size_; }
 private:
   MemoryMappedFile(const MemoryMappedFile&);
   MemoryMappedFile& operator=(const MemoryMappedFile&);

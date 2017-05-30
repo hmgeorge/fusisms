@@ -1,4 +1,10 @@
-// git pack file parser based
+// git parser
+//   searches a given sha1 in the pack file (if available)
+//   or if there is a obj entry corresponding to the the file
+//   supports only the undeltified representation for now
+//
+//   use: git fetch-pack -k --thin --depth=10 -v git@github.com:torvalds/linux.git HEAD
+//   use this program to open a single file instead of cloning the entire git project
 // on https://github.com/git/git/blob/master/Documentation/technical/pack-format.txt
 // opens the idx file first and searches for the corresponding pack file
 
@@ -6,8 +12,6 @@
 // shoutout to Ben Hoyt's explanation of the pack encoding scheme
 // at https://github.com/benhoyt/pygit/blob/master/pygit.py#L441
 
-
-// g++ -std=c++11 git-pack-reader.cc `pkg-config zlib --cflags --libs` -o pack-reader
 #include <cassert>
 #include <iostream>
 #include <sys/mman.h>
@@ -21,11 +25,13 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 
+#include <fstream>
 #include <functional>
 #include <algorithm>
 #include <vector>
 #include <iomanip>
 
+#include "z-file-inflater.h"
 #include "zlib.h"
 #include "memory-mapped-file.h"
 #include "utils.h"
@@ -65,9 +71,10 @@ std::string typeToStr(obj_type_t t) {
 }
 
 using MemoryMappedFile = fusism::MemoryMappedFile;
+using ZFileInflater = fusism::ZFileInflater;
 
 struct PackIdxReader {
-  PackIdxReader(char *file) : file_name_(file),
+  PackIdxReader(std::string file) : file_name_(file),
 			      addr_ (nullptr),
 			      len_(0),
 			      fd_(-1),
@@ -277,7 +284,7 @@ private:
   // perhaps type of an object can be printed by checking the sha1
   // with the pack objects
   void catTree(off64_t offset, off64_t size) {
-    MemoryMappedFile out(zInflate(offset, size));
+    MemoryMappedFile out(ZFileInflater(packed_fd_, offset, size).inflate());
     if (!out.valid()) return;
     off64_t cursor = 0;
     while (cursor < size) {
@@ -297,7 +304,7 @@ private:
   }
 
   void catCommitTree(off64_t offset, off64_t size) {
-    MemoryMappedFile out(zInflate(offset, size));
+    MemoryMappedFile out(ZFileInflater(packed_fd_, offset, size).inflate());
     if (!out.valid()) return;
 #if DEBUG
     std::cerr << out.dump(0, size) << "\n";
@@ -316,74 +323,6 @@ private:
     }
 
     return cat(&sha1[0]);
-  }
-
-#define ARRAY_SIZE(a) ((sizeof(a))/sizeof((a[0])))
-  // returns fd to a tmp file
-  int zInflate(off64_t offset, off64_t size) {
-    uint8_t input[1024];
-    uint8_t out[17];
-    char tmplate[16]={0};
-    snprintf(tmplate, sizeof(tmplate), "%s",
-	     "/tmp/catXXXXXX");
-    z_stream strm;
-    int ret;
-
-    strm.zalloc = Z_NULL;
-    strm.zfree = Z_NULL;
-    strm.opaque = Z_NULL;
-    strm.avail_in = 0;
-    strm.next_in = Z_NULL;
-    if (inflateInit(&strm) != Z_OK) {
-      std::cerr << "failed to initiaze z_stream\n";
-      return -1;
-    }
-
-    int temp_fd = mkstemp(tmplate);
-    if (temp_fd < 0) {
-      perror("mkstemp");
-      return -1;
-    }
-
-    lseek64(packed_fd_, offset, SEEK_SET);
-    bool eos = false;
-    uint32_t written = 0;
-    while (!eos) {
-      strm.next_out = out;
-      strm.avail_out = ARRAY_SIZE(out);
-      do {
-	if (strm.avail_in == 0) {
-	  strm.avail_in = read(packed_fd_, &input, ARRAY_SIZE(input));
-	  if (strm.avail_in < 0) {
-	    perror("read");
-	    return -1;
-	  }
-	  strm.next_in = &input[0];
-	}
-	ret = inflate(&strm, Z_NO_FLUSH);
-	assert(ret != Z_STREAM_ERROR); /* state not clobbered */
-	switch (ret) {
-	case Z_STREAM_END:
-	  eos = true;
-	case Z_OK:
-	  break;
-	default:
-	  (void)inflateEnd(&strm);
-	  std::cerr << ret << " failed to inflate pack\n";
-	  return -1;
-	}
-      } while (!eos && strm.avail_out > 0);
-      if (!eos) {
-	assert(strm.avail_out == 0);
-      }
-      written += write(temp_fd, out, ARRAY_SIZE(out)-strm.avail_out);
-    }
-    (void)inflateEnd(&strm);
-    if (written != size) {
-      std::cerr << ret << " failed to inflate pack completely\n";
-      return -1;
-    }
-    return temp_fd;
   }
 
   int setupPackedFd() {
@@ -438,18 +377,133 @@ private:
 };
 
 void usage() {
-  std::cerr << "pack-reader /path/to/idx/file sha1\n";
+  std::cerr << "pack-reader sha1\n";
+  std::cerr << "\t assumes a .git exists in the path to root\n";
 }
 
-// read the idx file.
-// use it to index into the .pack file.
+struct ObjectReader {
+  ObjectReader(std::string obj_path) :
+    path_(obj_path) {
+    fd_ = open(obj_path.c_str(), O_RDONLY);
+    struct stat sb;
+    if (fstat(fd_, &sb) == 0) {
+      size_ = sb.st_size;
+    }
+  }
+
+  ~ObjectReader() {
+    if (fd_ >= 0) {
+      close(fd_);
+    }
+  }
+
+  void cat() {
+    off64_t cursor = 0;
+    MemoryMappedFile out(ZFileInflater(fd_).inflate());
+    if (!out.valid()) return;
+
+    char type[5]={0};
+    for (int i=0; i<4; i++) type[i] = out[i];
+
+    if (!strcmp(type, "tree")) {
+      cursor += 4; // skip the size
+      cursor += 1; // skip the space
+      while (cursor < out.size()) {
+	// skip permission
+	while (out[cursor] != ' ') ++cursor;
+	// skip space as well
+	cursor += 1;
+	while (out[cursor] != '\0') {
+	  std::cerr << out[cursor];
+	  cursor += 1;
+	}
+	cursor += 1; // skip NUL as well
+	std::cerr << " ";
+	std::cerr << out.dump(cursor, 20) << "\n";
+	cursor += 20;
+      }
+    } else if (!strcmp(type, "blob")) {
+      cursor += 4; // skip the word
+      cursor += 1; // skip the space
+      cursor += 4; // skip the 32bit size
+      while (cursor < out.size()) {
+	std::cerr << out[cursor++];
+      }
+    } else {
+      std::cerr << "support for commit tree TBD\n";
+    }
+  }
+private:
+  std::string path_;
+  int fd_;
+  off64_t size_;
+};
+
+std::string find_git() {
+  char *p = getcwd(NULL, 0);
+  std::string s = p;
+  free(p);
+  while (s != "") {
+    auto gp = s+"/.git";
+    std::cerr << gp << "\n";
+    if (access(gp.c_str(), F_OK) == 0) {
+      return gp;
+    }
+    s = s.substr(0, s.rfind('/'));
+  }
+  return "";
+}
+
+std::string pack_file(std::string git_path) {
+  auto pack_info = git_path+"/objects/info/packs";
+  if (access(pack_info.c_str(),
+	     F_OK|R_OK) < 0) {
+    return "";
+  }
+  std::string line;
+  std::ifstream infile(pack_info);
+  std::getline(infile, line);
+  line = line.substr(line.find(' ')+1, line.find(".pack")-2);
+  return git_path+"/objects/pack/"+line+".idx";
+}
+
+std::string obj_file(std::string git_path,
+		     std::string sha1) {
+  auto obj_path = git_path + "/objects/" +
+                  sha1.substr(0,2) + "/" +
+                  sha1.substr(2);
+  std::cerr << obj_path << "\n";
+  if (access(obj_path.c_str(), F_OK|R_OK) < 0) {
+    return "";
+  }
+  return obj_path;
+}
+
 int main(int argc, char **argv)
 {
-  if (argc < 3) {
+  if (argc < 2) {
     usage();
     exit(-1);
   }
-  PackIdxReader reader(argv[1]);
-  // reader.list();
-  reader.cat(argv[2]);
+
+  std::string git_path = find_git();
+  if (git_path == "") {
+    std::cerr << "no git found in path /\n";
+    return -1;
+  }
+
+  std::string pack;
+  std::string obj;
+  if ((pack=pack_file(git_path)) != "") {
+    PackIdxReader reader(pack);
+    // reader.list();
+    reader.cat(argv[1]);
+  } else if ((obj=obj_file(git_path, argv[1])) != "") {
+    // see if there is a path of the type
+    // git_path/b1b2/b3...b20
+    ObjectReader reader(obj);
+    reader.cat();
+  } else {
+    std::cerr << argv[1] << " cannot be looked at\n";
+  }
 }
