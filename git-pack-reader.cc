@@ -42,6 +42,7 @@ typedef enum {
   OBJ_TREE,
   OBJ_BLOB,
   OBJ_TAG,
+  OBJ_FUTURE,
   OBJ_OFS_DELTA,
   OBJ_REF_DELTA
 } obj_type_t;
@@ -145,13 +146,23 @@ struct PackIdxReader {
       return;
     }
     switch ((*po_it).type()) {
+    case OBJ_BLOB:
+      catBlob((*po_it).offset(), (*po_it).size());
+      break;
     case OBJ_COMMIT:
       catCommitTree((*po_it).offset(), (*po_it).size());
       break;
     case OBJ_TREE:
       catTree((*po_it).offset(), (*po_it).size());
       break;
+    case OBJ_REF_DELTA:
+      std::cerr << "ref delta\n";
+      break;
+    case OBJ_OFS_DELTA:
+      catOfsDelta((*po_it).offset(), (*po_it).size());
+      break;
     default:
+      std::cerr << "unknown type " << (*po_it).type() << "\n";
       break;
     }
   }
@@ -274,6 +285,18 @@ private:
     init_check_ = true;
   }
 
+  void catBlob(off64_t offset, off64_t size) {
+    MemoryMappedFile out(ZFileInflater(packed_fd_,
+				       offset,
+				       size).inflate());
+    if (!out.valid()) return;
+    off64_t cursor = 0;
+    while (cursor < size) {
+      std::cerr << out[cursor++];
+    }
+    std::cerr << "\n";
+  }
+
   // offset in the pack file and uncompressed size
   // as per the spec.
   // after inflate, the format for the tree seems to be
@@ -323,6 +346,26 @@ private:
     }
 
     return cat(&sha1[0]);
+  }
+
+  void catOfsDelta(off64_t offset, off64_t size) {
+    MemoryMappedFile out(dup(packed_fd_));
+    if (!out.valid()) return;
+
+    off64_t cursor = offset;
+    uint8_t byte = out[cursor++];
+    off64_t delta_offset = (byte&0x7f); // 1SSSSSSS 1SSSSSS 0SSSSSSS
+    int32_t sh=4;
+    bool cont = byte&0x80;
+    while (cont) {
+      byte = out[cursor++];
+      delta_offset |= ((byte&0x7f)<<sh);
+      sh += 7;
+      cont = (byte&0x80);
+    }
+    std::cerr << size << " "
+	      << offset << " " << delta_offset << "\n";
+    return catBlob(cursor, size);
   }
 
   int setupPackedFd() {
